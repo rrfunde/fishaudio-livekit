@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.17"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fishaudio-livekit"
+version = "0.1.0"
+description = "Fish Audio text-to-speech plugin for LiveKit Agents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+  {name = "Rohit Funde"}
+]
+dependencies = [
+  "livekit-agents>=0.6",
+  "fish-audio-sdk>=0.1.9",
+  "httpx>=0.27",
+  "httpx-ws>=0.6",
+  "ormsgpack>=1.0",
+  "wsproto>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/rrfunde/fishaudio-livekit"
+Source = "https://github.com/rrfunde/fishaudio-livekit"
