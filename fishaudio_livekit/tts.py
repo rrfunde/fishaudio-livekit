@@ -25,7 +25,8 @@ from livekit.agents import (
 FISHAUDIO_API_KEY = os.getenv("FISHAUDIO_API_KEY")
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
-MIME_TYPE = "audio/wav"
+WAV_MIME_TYPE = "audio/wav"
+PCM_MIME_TYPE = "audio/pcm"
 
 
 @dataclass
@@ -149,7 +150,7 @@ class ChunkedStream(tts.ChunkedStream):
                 request_id=request_id,
                 sample_rate=SAMPLE_RATE,
                 num_channels=NUM_CHANNELS,
-                mime_type=MIME_TYPE,
+                mime_type=WAV_MIME_TYPE,
             )
             error: Exception | None = None
             while True:
@@ -191,19 +192,20 @@ class Stream(tts.SynthesizeStream):
             request_id=request_id,
             sample_rate=SAMPLE_RATE,
             num_channels=NUM_CHANNELS,
-            mime_type=MIME_TYPE,
+            mime_type=PCM_MIME_TYPE,
             stream=True,
         )
         output_emitter.start_segment(segment_id=request_id)
 
         request_kwargs = {
             "text": "",
-            "reference_id": self._opts.reference_id,
-            "format": "wav",
+            "format": "pcm",
             "temperature": self._opts.temperature,
             "top_p": self._opts.top_p,
             "sample_rate": SAMPLE_RATE,
         }
+        if self._opts.reference_id is not None:
+            request_kwargs["reference_id"] = self._opts.reference_id
         if self._opts.chunk_length is not None:
             request_kwargs["chunk_length"] = self._opts.chunk_length
         if self._opts.latency is not None:
