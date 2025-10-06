@@ -37,20 +37,21 @@ class _TTSOptions:
     top_p: float = 0.7
     chunk_length: int | None = 120
     latency: str | None = None
-    backend: str = "s1"
+    model: str = "s1"
 
 
 class TTS(tts.TTS):
     def __init__(
         self,
         *,
+        api_key: str | None = None,
         language: str = "en",
         reference_id: str = None,
         temperature: float = 0.7,
         top_p: float = 0.7,
         chunk_length: int | None = 120,
         latency: str | None = None,
-        backend: str = "s1",
+        model: str = "s1",
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -64,12 +65,12 @@ class TTS(tts.TTS):
             top_p=top_p,
             chunk_length=chunk_length,
             latency=latency,
-            backend=backend,
+            model=model,
         )
-        if not FISHAUDIO_API_KEY:
+        self._api_key = api_key or FISHAUDIO_API_KEY
+        if not self._api_key:
             raise APIConnectionError("FISHAUDIO_API_KEY not set")
-        self._ws = WebSocketSession(FISHAUDIO_API_KEY)
-        self._api_key = FISHAUDIO_API_KEY
+        self._ws = WebSocketSession(self._api_key)
 
     def synthesize(
         self,
@@ -137,7 +138,7 @@ class ChunkedStream(tts.ChunkedStream):
             # Bridge the blocking Fish Audio generator into the async emitter.
             def run_tts() -> None:
                 try:
-                    for chunk in self._ws.tts(tts_request, [], backend=self._opts.backend):
+                    for chunk in self._ws.tts(tts_request, [], backend=self._opts.model):
                         loop.call_soon_threadsafe(courier_queue.put_nowait, chunk)
                 except Exception as exc:  # pragma: no cover - network runtime
                     loop.call_soon_threadsafe(courier_queue.put_nowait, exc)
@@ -285,7 +286,7 @@ class Stream(tts.SynthesizeStream):
                 async with aconnect_ws(
                     "/v1/tts/live",
                     client=client,
-                    headers={"model": self._opts.backend},
+                    headers={"model": self._opts.model},
                 ) as ws:
                     await ws.send_bytes(
                         ormsgpack.packb({"event": "start", "request": tts_request})
