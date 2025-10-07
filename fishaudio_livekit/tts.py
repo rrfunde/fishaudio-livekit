@@ -167,7 +167,7 @@ class ChunkedStream(tts.ChunkedStream):
             await worker
             if error is not None:
                 raise error
-            output_emitter.flush()
+            output_emitter.end_input()
         except Exception as e:
             raise APIConnectionError() from e
 
