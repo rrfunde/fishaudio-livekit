@@ -119,7 +119,7 @@ class ChunkedStream(tts.ChunkedStream):
             request_kwargs = {
                 "text": self.input_text,
                 "reference_id": self._opts.reference_id,
-                "format": "wav",
+                "format": "pcm",
                 "temperature": self._opts.temperature,
                 "top_p": self._opts.top_p,
                 "sample_rate": SAMPLE_RATE,
@@ -151,7 +151,7 @@ class ChunkedStream(tts.ChunkedStream):
                 request_id=request_id,
                 sample_rate=SAMPLE_RATE,
                 num_channels=NUM_CHANNELS,
-                mime_type=WAV_MIME_TYPE,
+                mime_type=PCM_MIME_TYPE,
             )
             error: Exception | None = None
             while True:
