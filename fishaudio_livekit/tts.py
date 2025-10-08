@@ -186,7 +186,6 @@ class Stream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._opts = opts
         self._api_key = api_key
-        self._input_closed = False  # Track if input stream is closed
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = str(uuid.uuid4().hex)[:12]
@@ -197,7 +196,7 @@ class Stream(tts.SynthesizeStream):
             mime_type=PCM_MIME_TYPE,
             stream=True,
         )
-        segment_started = False
+        output_emitter.start_segment(segment_id=request_id)
 
         request_kwargs = {
             "text": "",
@@ -257,9 +256,6 @@ class Stream(tts.SynthesizeStream):
 
                 await _flush_pending(force=True)
 
-                # Mark that input is closed
-                self._input_closed = True
-
                 if started:
                     try:
                         await ws.send_bytes(ormsgpack.packb({"event": "stop"}))
@@ -269,14 +265,6 @@ class Stream(tts.SynthesizeStream):
                 raise
 
         async def _recv_loop(ws) -> None:
-            nonlocal segment_started
-
-            def ensure_segment_started() -> None:
-                nonlocal segment_started
-                if not segment_started:
-                    output_emitter.start_segment(segment_id=request_id)
-                    segment_started = True
-
             try:
                 while True:
                     message = await ws.receive_bytes()
@@ -285,23 +273,10 @@ class Stream(tts.SynthesizeStream):
                     if event == "audio":
                         chunk = data.get("audio")
                         if chunk:
-                            ensure_segment_started()
                             output_emitter.push(chunk)
                     elif event == "finish":
-                        # Process any final audio chunk
-                        chunk = data.get("audio")
-                        if chunk:
-                            ensure_segment_started()
-                            output_emitter.push(chunk)
-
-                        # Check if there's an error
                         if data.get("reason") == "error":
                             raise APIConnectionError()
-
-                        # Only end input if the input stream is closed
-                        # This ensures we don't signal completion too early
-                        if self._input_closed:
-                            output_emitter.end_input()
                         break
             except WebSocketDisconnect as exc:
                 raise APIConnectionError() from exc
@@ -336,4 +311,5 @@ class Stream(tts.SynthesizeStream):
             LocalProtocolError,
         ) as exc:
             raise APIConnectionError() from exc
-        # Note: end_input() is now called inside _recv_loop only when appropriate
+        finally:
+            output_emitter.end_input()
