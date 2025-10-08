@@ -196,7 +196,7 @@ class Stream(tts.SynthesizeStream):
             mime_type=PCM_MIME_TYPE,
             stream=True,
         )
-        output_emitter.start_segment(segment_id=request_id)
+        segment_started = False
 
         request_kwargs = {
             "text": "",
@@ -265,6 +265,14 @@ class Stream(tts.SynthesizeStream):
                 raise
 
         async def _recv_loop(ws) -> None:
+            nonlocal segment_started
+
+            def ensure_segment_started() -> None:
+                nonlocal segment_started
+                if not segment_started:
+                    output_emitter.start_segment(segment_id=request_id)
+                    segment_started = True
+
             try:
                 while True:
                     message = await ws.receive_bytes()
@@ -273,8 +281,13 @@ class Stream(tts.SynthesizeStream):
                     if event == "audio":
                         chunk = data.get("audio")
                         if chunk:
+                            ensure_segment_started()
                             output_emitter.push(chunk)
                     elif event == "finish":
+                        chunk = data.get("audio")
+                        if chunk:
+                            ensure_segment_started()
+                            output_emitter.push(chunk)
                         if data.get("reason") == "error":
                             raise APIConnectionError()
                         break
