@@ -33,6 +33,26 @@ async with tts.stream() as stream:
 - Set `FISHAUDIO_API_KEY` before launching your agent or worker.
 - The package depends on `fish-audio-sdk`, `httpx`, and `httpx-ws`; these install automatically via pip.
 
+## Cloud Deployment
+
+Deploy your Fish Audio LiveKit agent to the cloud:
+
+```bash
+# Run locally with Docker
+./cloud_deploy.sh docker
+
+# Deploy to Fly.io
+./cloud_deploy.sh fly
+
+# Deploy to Railway
+./cloud_deploy.sh railway
+
+# Deploy to Render
+./cloud_deploy.sh render
+```
+
+See [docs/CLOUD_DEPLOYMENT.md](docs/CLOUD_DEPLOYMENT.md) for detailed deployment instructions.
+
 ## Development
 
 ```bash
