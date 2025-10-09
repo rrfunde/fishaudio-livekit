@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fishaudio-livekit"
-version = "0.1.7"
+version = "0.1.8"
 description = "Fish Audio text-to-speech plugin for LiveKit Agents"
 readme = "README.md"
 requires-python = ">=3.9"

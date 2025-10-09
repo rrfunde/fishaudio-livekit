@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 import ormsgpack
-from fish_audio_sdk import TTSRequest, WebSocketSession
+from fish_audio_sdk import Prosody, TTSRequest, WebSocketSession
 from httpx_ws import (
     WebSocketDisconnect,
     WebSocketNetworkError,
@@ -38,6 +38,8 @@ class _TTSOptions:
     chunk_length: int | None = 120
     latency: str | None = None
     model: str = "s1"
+    speed: float = 1.0
+    volume: float = 0.0
 
 
 class TTS(tts.TTS):
@@ -52,6 +54,8 @@ class TTS(tts.TTS):
         chunk_length: int | None = 120,
         latency: str | None = None,
         model: str = "s1",
+        speed: float = 1.0,
+        volume: float = 0.0,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -66,6 +70,8 @@ class TTS(tts.TTS):
             chunk_length=chunk_length,
             latency=latency,
             model=model,
+            speed=speed,
+            volume=volume,
         )
         self._api_key = api_key or FISHAUDIO_API_KEY
         if not self._api_key:
@@ -123,6 +129,7 @@ class ChunkedStream(tts.ChunkedStream):
                 "temperature": self._opts.temperature,
                 "top_p": self._opts.top_p,
                 "sample_rate": SAMPLE_RATE,
+                "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
             }
             if self._opts.chunk_length is not None:
                 request_kwargs["chunk_length"] = self._opts.chunk_length
@@ -204,6 +211,7 @@ class Stream(tts.SynthesizeStream):
             "temperature": self._opts.temperature,
             "top_p": self._opts.top_p,
             "sample_rate": SAMPLE_RATE,
+            "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
         }
         if self._opts.reference_id is not None:
             request_kwargs["reference_id"] = self._opts.reference_id
