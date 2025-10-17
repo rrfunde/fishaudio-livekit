@@ -40,6 +40,7 @@ class _TTSOptions:
     model: str = "s1"
     speed: float = 1.0
     volume: float = 0.0
+    sample_rate: int = 44100
 
 
 class TTS(tts.TTS):
@@ -56,10 +57,11 @@ class TTS(tts.TTS):
         model: str = "s1",
         speed: float = 1.0,
         volume: float = 0.0,
+        sample_rate: int = 44100,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
-            sample_rate=SAMPLE_RATE,
+            sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )
         self._opts = _TTSOptions(
@@ -72,6 +74,7 @@ class TTS(tts.TTS):
             model=model,
             speed=speed,
             volume=volume,
+            sample_rate=sample_rate,
         )
         self._api_key = api_key or FISHAUDIO_API_KEY
         if not self._api_key:
@@ -128,7 +131,7 @@ class ChunkedStream(tts.ChunkedStream):
                 "format": "pcm",
                 "temperature": self._opts.temperature,
                 "top_p": self._opts.top_p,
-                "sample_rate": SAMPLE_RATE,
+                "sample_rate": self._opts.sample_rate,
                 "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
             }
             if self._opts.chunk_length is not None:
@@ -156,7 +159,7 @@ class ChunkedStream(tts.ChunkedStream):
 
             output_emitter.initialize(
                 request_id=request_id,
-                sample_rate=SAMPLE_RATE,
+                sample_rate=self._opts.sample_rate,
                 num_channels=NUM_CHANNELS,
                 mime_type=PCM_MIME_TYPE,
             )
@@ -198,7 +201,7 @@ class Stream(tts.SynthesizeStream):
         request_id = str(uuid.uuid4().hex)[:12]
         output_emitter.initialize(
             request_id=request_id,
-            sample_rate=SAMPLE_RATE,
+            sample_rate=self._opts.sample_rate,
             num_channels=NUM_CHANNELS,
             mime_type=PCM_MIME_TYPE,
             stream=True,
@@ -210,7 +213,7 @@ class Stream(tts.SynthesizeStream):
             "format": "pcm",
             "temperature": self._opts.temperature,
             "top_p": self._opts.top_p,
-            "sample_rate": SAMPLE_RATE,
+            "sample_rate": self._opts.sample_rate,
             "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
         }
         if self._opts.reference_id is not None:
