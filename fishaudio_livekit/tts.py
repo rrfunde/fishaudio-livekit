@@ -23,7 +23,7 @@ from livekit.agents import (
 )
 
 FISHAUDIO_API_KEY = os.getenv("FISHAUDIO_API_KEY")
-SAMPLE_RATE = 24000
+SAMPLE_RATE = 44100
 NUM_CHANNELS = 1
 WAV_MIME_TYPE = "audio/wav"
 PCM_MIME_TYPE = "audio/pcm"
@@ -203,7 +203,7 @@ class Stream(tts.SynthesizeStream):
             mime_type=PCM_MIME_TYPE,
             stream=True,
         )
-        output_emitter.start_segment(segment_id=request_id)
+        # Delay start_segment until first audio chunk arrives to prevent voice breaking
 
         request_kwargs = {
             "text": "",
@@ -243,8 +243,9 @@ class Stream(tts.SynthesizeStream):
                 normalized = text_raw.strip()
                 if not normalized:
                     return
-                if not force and normalized == last_sent:
-                    return
+                # REMOVED: Text deduplication check that could skip legitimate repeated text
+                # This was causing issues where repeated text wouldn't be synthesized
+                # Original line: if not force and normalized == last_sent: return
                 last_sent = normalized
                 if not started:
                     self._mark_started()
@@ -273,19 +274,34 @@ class Stream(tts.SynthesizeStream):
                 raise
 
         async def _recv_loop(ws) -> None:
+            segment_started = False
+            # Use timeout from conn_options, default to 30 seconds like Cartesia
+            receive_timeout = timeout if timeout else 30.0
             try:
                 while True:
-                    message = await ws.receive_bytes()
+                    # Add timeout to prevent indefinite hanging
+                    message = await asyncio.wait_for(
+                        ws.receive_bytes(),
+                        timeout=receive_timeout
+                    )
                     data = ormsgpack.unpackb(message)
                     event = data.get("event")
                     if event == "audio":
                         chunk = data.get("audio")
                         if chunk:
+                            # Start segment only when first audio chunk arrives
+                            if not segment_started:
+                                output_emitter.start_segment(segment_id=request_id)
+                                segment_started = True
                             output_emitter.push(chunk)
                     elif event == "finish":
                         if data.get("reason") == "error":
                             raise APIConnectionError()
                         break
+            except asyncio.TimeoutError:
+                # No message received within timeout - assume synthesis complete
+                # This prevents hanging when finish event doesn't arrive
+                pass
             except WebSocketDisconnect as exc:
                 raise APIConnectionError() from exc
 
