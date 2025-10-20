@@ -36,7 +36,6 @@ from livekit.agents import (
     tts as lk_tts,
 )
 
-from fishaudio_livekit.tts import TTS as FishTTS  # type: ignore
 from fishaudio_livekit.tts import ChunkedStream as FishChunkedStream  # type: ignore
 from fishaudio_livekit.tts import Stream as FishStream  # type: ignore
 
