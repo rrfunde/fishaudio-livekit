@@ -106,7 +106,7 @@ class _FadingChunkedStream(FishChunkedStream):
     def __init__(
         self,
         *,
-        tts: "StableFishTTS",
+        tts: "TTS",
         input_text: str,
         conn_options: APIConnectOptions,
         fade_duration_ms: Optional[int],
@@ -200,7 +200,7 @@ class _FadingStream(FishStream):
     def __init__(
         self,
         *,
-        tts: "StableFishTTS",
+        tts: "TTS",
         conn_options: APIConnectOptions,
         fade_duration_ms: Optional[int],
     ) -> None:
@@ -361,7 +361,7 @@ class _FadingStream(FishStream):
             output_emitter.end_input()
 
 
-class StableFishTTS(FishTTS):
+class TTS(FishTTS):
     """
     Drop-in replacement for ``fishaudio_livekit.TTS`` that smooths the first
     audio frames via a configurable fade-in.
