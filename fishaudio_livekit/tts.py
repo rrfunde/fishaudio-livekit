@@ -1,12 +1,26 @@
+"""
+Stable Fish Audio TTS adapter for LiveKit agents.
+
+This module wraps the upstream ``fishaudio_livekit`` implementation and adds a
+deterministic fade-in smoothing step for the first audio frames of every
+generation. The native websocket client
+(`fishaudio_tts_websocket.py`) yields clean audio because playback buffers the
+initial samples; when streaming directly through LiveKit we explicitly soften
+the first ~200 ms to avoid the audible instability reported at the start of
+each user turn.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import contextlib
-import os
 import uuid
-from dataclasses import dataclass
+from array import array
+from typing import Optional
 
 import httpx
 import ormsgpack
-from fish_audio_sdk import Prosody, TTSRequest, WebSocketSession
+from fish_audio_sdk import Prosody, TTSRequest
 from httpx_ws import (
     WebSocketDisconnect,
     WebSocketNetworkError,
@@ -16,114 +30,107 @@ from httpx_ws import (
 from wsproto.utilities import LocalProtocolError
 
 from livekit.agents import (
-    DEFAULT_API_CONNECT_OPTIONS,
     APIConnectionError,
     APIConnectOptions,
-    tts,
+    DEFAULT_API_CONNECT_OPTIONS,
+    tts as lk_tts,
 )
 
-FISHAUDIO_API_KEY = os.getenv("FISHAUDIO_API_KEY")
-SAMPLE_RATE = 44100
-NUM_CHANNELS = 1
-WAV_MIME_TYPE = "audio/wav"
+from fishaudio_livekit.tts import TTS as FishTTS  # type: ignore
+from fishaudio_livekit.tts import ChunkedStream as FishChunkedStream  # type: ignore
+from fishaudio_livekit.tts import Stream as FishStream  # type: ignore
+
 PCM_MIME_TYPE = "audio/pcm"
+NUM_CHANNELS = 1
+DEFAULT_FADE_MS = 220
 
 
-@dataclass
-class _TTSOptions:
-    language: str
-    reference_id: str | None = None
-    temperature: float = 0.7
-    top_p: float = 0.7
-    chunk_length: int | None = 120
-    latency: str | None = None
-    model: str = "s1"
-    speed: float = 1.0
-    volume: float = 0.0
-    sample_rate: int = 44100
+class _FadeInProcessor:
+    """Gradually ramps in the first few PCM frames to avoid startup pops."""
 
-
-class TTS(tts.TTS):
     def __init__(
         self,
         *,
-        api_key: str | None = None,
-        language: str = "en",
-        reference_id: str = None,
-        temperature: float = 0.7,
-        top_p: float = 0.7,
-        chunk_length: int | None = 120,
-        latency: str | None = None,
-        model: str = "s1",
-        speed: float = 1.0,
-        volume: float = 0.0,
-        sample_rate: int = 44100,
-    ):
-        super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=True),
-            sample_rate=sample_rate,
-            num_channels=NUM_CHANNELS,
-        )
-        self._opts = _TTSOptions(
-            language=language,
-            reference_id=reference_id,
-            temperature=temperature,
-            top_p=top_p,
-            chunk_length=chunk_length,
-            latency=latency,
-            model=model,
-            speed=speed,
-            volume=volume,
-            sample_rate=sample_rate,
-        )
-        self._api_key = api_key or FISHAUDIO_API_KEY
-        if not self._api_key:
-            raise APIConnectionError("FISHAUDIO_API_KEY not set")
-        self._ws = WebSocketSession(self._api_key)
+        sample_rate: int,
+        num_channels: int,
+        duration_ms: int = DEFAULT_FADE_MS,
+    ) -> None:
+        self._sample_width = 2  # Fish Audio returns pcm_s16le
+        self._num_channels = max(1, num_channels)
+        frame_width = self._sample_width * self._num_channels
+        if frame_width <= 0:
+            raise ValueError("invalid frame width for fade-in processor")
+        self._frame_width = frame_width
+        frames = max(0, int(sample_rate * duration_ms / 1000))
+        self._fade_frames = frames
+        self._processed_frames = 0
 
-    def synthesize(
-        self,
-        text: str,
-        *,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> "ChunkedStream":
-        return ChunkedStream(
-            tts=self,
-            input_text=text,
-            conn_options=conn_options,
-            opts=self._opts,
-            ws=self._ws,
-        )
+    def process(self, chunk: bytes) -> bytes:
+        if not chunk or self._fade_frames <= 0:
+            return chunk
+        if len(chunk) % self._frame_width != 0:
+            # Unexpected frame alignment; skip modifying to avoid corruption.
+            return chunk
 
-    def stream(
-        self,
-        *,
-        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> "Stream":
-        return Stream(
-            tts=self,
-            conn_options=conn_options,
-            opts=self._opts,
-            api_key=self._api_key,
-        )
+        frame_count = len(chunk) // self._frame_width
+        if self._processed_frames >= self._fade_frames or frame_count == 0:
+            self._processed_frames += frame_count
+            return chunk
+
+        fade_remaining = self._fade_frames - self._processed_frames
+        apply_frames = min(frame_count, fade_remaining)
+        if apply_frames <= 0:
+            self._processed_frames += frame_count
+            return chunk
+
+        samples = array("h")
+        samples.frombytes(chunk)
+        start_frame = self._processed_frames
+        for frame_idx in range(apply_frames):
+            fade_position = start_frame + frame_idx
+            factor = fade_position / self._fade_frames
+            if factor > 1.0:
+                factor = 1.0
+            base_index = frame_idx * self._num_channels
+            for channel in range(self._num_channels):
+                idx = base_index + channel
+                samples[idx] = int(samples[idx] * factor)
+
+        self._processed_frames += frame_count
+        return samples.tobytes()
 
 
-class ChunkedStream(tts.ChunkedStream):
+class _FadingChunkedStream(FishChunkedStream):
+    """ChunkedStream that applies fade-in smoothing before emitting audio."""
+
     def __init__(
         self,
         *,
-        tts: TTS,
+        tts: "StableFishTTS",
         input_text: str,
         conn_options: APIConnectOptions,
-        opts: _TTSOptions,
-        ws: WebSocketSession,
+        fade_duration_ms: Optional[int],
     ) -> None:
-        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
-        self._ws = ws
-        self._opts = opts
+        super().__init__(
+            tts=tts,
+            input_text=input_text,
+            conn_options=conn_options,
+            opts=tts._opts,  # noqa: SLF001
+            ws=tts._ws,  # noqa: SLF001
+        )
+        self._fade_duration_ms = fade_duration_ms
 
-    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+    async def _run(self, output_emitter: lk_tts.AudioEmitter) -> None:  # noqa: D401
         request_id = str(uuid.uuid4().hex)[:12]
+        fade_processor = (
+            _FadeInProcessor(
+                sample_rate=self._opts.sample_rate,
+                num_channels=NUM_CHANNELS,
+                duration_ms=self._fade_duration_ms,
+            )
+            if self._fade_duration_ms and self._fade_duration_ms > 0
+            else None
+        )
         try:
             request_kwargs = {
                 "text": self.input_text,
@@ -132,7 +139,10 @@ class ChunkedStream(tts.ChunkedStream):
                 "temperature": self._opts.temperature,
                 "top_p": self._opts.top_p,
                 "sample_rate": self._opts.sample_rate,
-                "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
+                "prosody": Prosody(
+                    speed=self._opts.speed,
+                    volume=self._opts.volume,
+                ),
             }
             if self._opts.chunk_length is not None:
                 request_kwargs["chunk_length"] = self._opts.chunk_length
@@ -145,12 +155,11 @@ class ChunkedStream(tts.ChunkedStream):
             courier_queue: asyncio.Queue = asyncio.Queue()
             sentinel = object()
 
-            # Bridge the blocking Fish Audio generator into the async emitter.
             def run_tts() -> None:
                 try:
                     for chunk in self._ws.tts(tts_request, [], backend=self._opts.model):
                         loop.call_soon_threadsafe(courier_queue.put_nowait, chunk)
-                except Exception as exc:  # pragma: no cover - network runtime
+                except Exception as exc:  # pragma: no cover
                     loop.call_soon_threadsafe(courier_queue.put_nowait, exc)
                 finally:
                     loop.call_soon_threadsafe(courier_queue.put_nowait, sentinel)
@@ -172,33 +181,49 @@ class ChunkedStream(tts.ChunkedStream):
                     error = item
                     continue
                 if error is None:
-                    output_emitter.push(item)
+                    processed = (
+                        fade_processor.process(item) if fade_processor else item
+                    )
+                    output_emitter.push(processed)
 
             await worker
             if error is not None:
                 raise error
             output_emitter.end_input()
-        except Exception as e:
-            raise APIConnectionError() from e
+        except Exception as exc:  # pragma: no cover
+            raise APIConnectionError() from exc
 
 
-class Stream(tts.SynthesizeStream):
-    API_BASE_URL = "https://api.fish.audio"
+class _FadingStream(FishStream):
+    """Streaming synthesize implementation with fade-in smoothing."""
 
     def __init__(
         self,
         *,
-        tts: TTS,
+        tts: "StableFishTTS",
         conn_options: APIConnectOptions,
-        opts: _TTSOptions,
-        api_key: str,
+        fade_duration_ms: Optional[int],
     ) -> None:
-        super().__init__(tts=tts, conn_options=conn_options)
-        self._opts = opts
-        self._api_key = api_key
+        super().__init__(
+            tts=tts,
+            conn_options=conn_options,
+            opts=tts._opts,  # noqa: SLF001
+            api_key=tts._api_key,  # noqa: SLF001
+        )
+        self._fade_duration_ms = fade_duration_ms
 
-    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+    async def _run(self, output_emitter: lk_tts.AudioEmitter) -> None:  # noqa: D401
         request_id = str(uuid.uuid4().hex)[:12]
+        fade_processor = (
+            _FadeInProcessor(
+                sample_rate=self._opts.sample_rate,
+                num_channels=NUM_CHANNELS,
+                duration_ms=self._fade_duration_ms,
+            )
+            if self._fade_duration_ms and self._fade_duration_ms > 0
+            else None
+        )
+
         output_emitter.initialize(
             request_id=request_id,
             sample_rate=self._opts.sample_rate,
@@ -206,7 +231,6 @@ class Stream(tts.SynthesizeStream):
             mime_type=PCM_MIME_TYPE,
             stream=True,
         )
-        # Delay start_segment until first audio chunk arrives to prevent voice breaking
 
         request_kwargs = {
             "text": "",
@@ -214,7 +238,10 @@ class Stream(tts.SynthesizeStream):
             "temperature": self._opts.temperature,
             "top_p": self._opts.top_p,
             "sample_rate": self._opts.sample_rate,
-            "prosody": Prosody(speed=self._opts.speed, volume=self._opts.volume),
+            "prosody": Prosody(
+                speed=self._opts.speed,
+                volume=self._opts.volume,
+            ),
         }
         if self._opts.reference_id is not None:
             request_kwargs["reference_id"] = self._opts.reference_id
@@ -225,7 +252,7 @@ class Stream(tts.SynthesizeStream):
 
         tts_request = TTSRequest(**request_kwargs).model_dump(exclude_none=True)
 
-        timeout = self._conn_options.timeout
+        timeout = self._conn_options.timeout  # noqa: SLF001
         client = httpx.AsyncClient(
             base_url=self.API_BASE_URL,
             headers={"Authorization": f"Bearer {self._api_key}"},
@@ -235,10 +262,9 @@ class Stream(tts.SynthesizeStream):
         async def _send_loop(ws) -> None:
             pending: list[str] = []
             started = False
-            last_sent = ""
 
             async def _flush_pending(force: bool = False) -> None:
-                nonlocal started, last_sent
+                nonlocal started
                 if not pending:
                     return
                 text_raw = "".join(pending)
@@ -246,10 +272,6 @@ class Stream(tts.SynthesizeStream):
                 normalized = text_raw.strip()
                 if not normalized:
                     return
-                # REMOVED: Text deduplication check that could skip legitimate repeated text
-                # This was causing issues where repeated text wouldn't be synthesized
-                # Original line: if not force and normalized == last_sent: return
-                last_sent = normalized
                 if not started:
                     self._mark_started()
                     started = True
@@ -259,11 +281,10 @@ class Stream(tts.SynthesizeStream):
                 await ws.send_bytes(ormsgpack.packb({"event": "flush"}))
 
             try:
-                async for item in self._input_ch:
-                    if isinstance(item, self._FlushSentinel):
+                async for item in self._input_ch:  # noqa: SLF001
+                    if isinstance(item, self._FlushSentinel):  # noqa: SLF001
                         await _flush_pending()
                         continue
-
                     pending.append(item)
 
                 await _flush_pending(force=True)
@@ -277,33 +298,29 @@ class Stream(tts.SynthesizeStream):
                 raise
 
         async def _recv_loop(ws) -> None:
-            segment_started = False
-            # Use timeout from conn_options, default to 30 seconds like Cartesia
             receive_timeout = timeout if timeout else 30.0
             try:
                 while True:
-                    # Add timeout to prevent indefinite hanging
                     message = await asyncio.wait_for(
                         ws.receive_bytes(),
-                        timeout=receive_timeout
+                        timeout=receive_timeout,
                     )
                     data = ormsgpack.unpackb(message)
                     event = data.get("event")
                     if event == "audio":
                         chunk = data.get("audio")
                         if chunk:
-                            # Start segment only when first audio chunk arrives
-                            if not segment_started:
-                                output_emitter.start_segment(segment_id=request_id)
-                                segment_started = True
-                            output_emitter.push(chunk)
+                            processed = (
+                                fade_processor.process(chunk)
+                                if fade_processor
+                                else chunk
+                            )
+                            output_emitter.push(processed)
                     elif event == "finish":
                         if data.get("reason") == "error":
                             raise APIConnectionError()
                         break
             except asyncio.TimeoutError:
-                # No message received within timeout - assume synthesis complete
-                # This prevents hanging when finish event doesn't arrive
                 pass
             except WebSocketDisconnect as exc:
                 raise APIConnectionError() from exc
@@ -318,6 +335,8 @@ class Stream(tts.SynthesizeStream):
                     await ws.send_bytes(
                         ormsgpack.packb({"event": "start", "request": tts_request})
                     )
+
+                    output_emitter.start_segment(segment_id=request_id)
 
                     send_task = asyncio.create_task(_send_loop(ws))
                     recv_task = asyncio.create_task(_recv_loop(ws))
@@ -340,3 +359,43 @@ class Stream(tts.SynthesizeStream):
             raise APIConnectionError() from exc
         finally:
             output_emitter.end_input()
+
+
+class StableFishTTS(FishTTS):
+    """
+    Drop-in replacement for ``fishaudio_livekit.TTS`` that smooths the first
+    audio frames via a configurable fade-in.
+    """
+
+    def __init__(
+        self,
+        *,
+        fade_duration_ms: Optional[int] = DEFAULT_FADE_MS,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._fade_duration_ms = fade_duration_ms
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> lk_tts.ChunkedStream:
+        return _FadingChunkedStream(
+            tts=self,
+            input_text=text,
+            conn_options=conn_options,
+            fade_duration_ms=self._fade_duration_ms,
+        )
+
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> lk_tts.SynthesizeStream:
+        return _FadingStream(
+            tts=self,
+            conn_options=conn_options,
+            fade_duration_ms=self._fade_duration_ms,
+        )
