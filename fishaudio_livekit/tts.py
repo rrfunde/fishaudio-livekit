@@ -1,26 +1,23 @@
 """
 Stable Fish Audio TTS adapter for LiveKit agents.
 
-This module wraps the upstream ``fishaudio_livekit`` implementation and adds a
-deterministic fade-in smoothing step for the first audio frames of every
-generation. The native websocket client
-(`fishaudio_tts_websocket.py`) yields clean audio because playback buffers the
-initial samples; when streaming directly through LiveKit we explicitly soften
-the first ~200 ms to avoid the audible instability reported at the start of
-each user turn.
+Reimplements the ``fishaudio_livekit`` client in-place so we can add fade-in
+ smoothing without depending on the upstream FishTTS package.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import uuid
 from array import array
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 import ormsgpack
-from fish_audio_sdk import Prosody, TTSRequest
+from fish_audio_sdk import Prosody, TTSRequest, WebSocketSession
 from httpx_ws import (
     WebSocketDisconnect,
     WebSocketNetworkError,
@@ -36,12 +33,25 @@ from livekit.agents import (
     tts as lk_tts,
 )
 
-from fishaudio_livekit.tts import ChunkedStream as FishChunkedStream  # type: ignore
-from fishaudio_livekit.tts import Stream as FishStream  # type: ignore
-
-PCM_MIME_TYPE = "audio/pcm"
+FISHAUDIO_API_KEY = os.getenv("FISHAUDIO_API_KEY")
+SAMPLE_RATE = 44100
 NUM_CHANNELS = 1
+PCM_MIME_TYPE = "audio/pcm"
 DEFAULT_FADE_MS = 220
+
+
+@dataclass
+class _TTSOptions:
+    language: str
+    reference_id: str | None = None
+    temperature: float = 0.7
+    top_p: float = 0.7
+    chunk_length: int | None = 120
+    latency: str | None = None
+    model: str = "s1"
+    speed: float = 1.0
+    volume: float = 0.0
+    sample_rate: int = SAMPLE_RATE
 
 
 class _FadeInProcessor:
@@ -54,7 +64,7 @@ class _FadeInProcessor:
         num_channels: int,
         duration_ms: int = DEFAULT_FADE_MS,
     ) -> None:
-        self._sample_width = 2  # Fish Audio returns pcm_s16le
+        self._sample_width = 2  # pcm_s16le
         self._num_channels = max(1, num_channels)
         frame_width = self._sample_width * self._num_channels
         if frame_width <= 0:
@@ -68,8 +78,7 @@ class _FadeInProcessor:
         if not chunk or self._fade_frames <= 0:
             return chunk
         if len(chunk) % self._frame_width != 0:
-            # Unexpected frame alignment; skip modifying to avoid corruption.
-            return chunk
+            return chunk  # avoid corrupting misaligned buffers
 
         frame_count = len(chunk) // self._frame_width
         if self._processed_frames >= self._fade_frames or frame_count == 0:
@@ -87,9 +96,7 @@ class _FadeInProcessor:
         start_frame = self._processed_frames
         for frame_idx in range(apply_frames):
             fade_position = start_frame + frame_idx
-            factor = fade_position / self._fade_frames
-            if factor > 1.0:
-                factor = 1.0
+            factor = min(fade_position / self._fade_frames, 1.0)
             base_index = frame_idx * self._num_channels
             for channel in range(self._num_channels):
                 idx = base_index + channel
@@ -99,8 +106,8 @@ class _FadeInProcessor:
         return samples.tobytes()
 
 
-class _FadingChunkedStream(FishChunkedStream):
-    """ChunkedStream that applies fade-in smoothing before emitting audio."""
+class ChunkedStream(lk_tts.ChunkedStream):
+    """Chunked synthesize helper with fade-in smoothing."""
 
     def __init__(
         self,
@@ -108,15 +115,13 @@ class _FadingChunkedStream(FishChunkedStream):
         tts: "TTS",
         input_text: str,
         conn_options: APIConnectOptions,
+        opts: _TTSOptions,
+        ws: WebSocketSession,
         fade_duration_ms: Optional[int],
     ) -> None:
-        super().__init__(
-            tts=tts,
-            input_text=input_text,
-            conn_options=conn_options,
-            opts=tts._opts,  # noqa: SLF001
-            ws=tts._ws,  # noqa: SLF001
-        )
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._ws = ws
+        self._opts = opts
         self._fade_duration_ms = fade_duration_ms
 
     async def _run(self, output_emitter: lk_tts.AudioEmitter) -> None:  # noqa: D401
@@ -193,22 +198,23 @@ class _FadingChunkedStream(FishChunkedStream):
             raise APIConnectionError() from exc
 
 
-class _FadingStream(FishStream):
-    """Streaming synthesize implementation with fade-in smoothing."""
+class Stream(lk_tts.SynthesizeStream):
+    """Streaming synthesize helper with fade-in smoothing."""
+
+    API_BASE_URL = "https://api.fish.audio"
 
     def __init__(
         self,
         *,
         tts: "TTS",
         conn_options: APIConnectOptions,
+        opts: _TTSOptions,
+        api_key: str,
         fade_duration_ms: Optional[int],
     ) -> None:
-        super().__init__(
-            tts=tts,
-            conn_options=conn_options,
-            opts=tts._opts,  # noqa: SLF001
-            api_key=tts._api_key,  # noqa: SLF001
-        )
+        super().__init__(tts=tts, conn_options=conn_options)
+        self._opts = opts
+        self._api_key = api_key
         self._fade_duration_ms = fade_duration_ms
 
     async def _run(self, output_emitter: lk_tts.AudioEmitter) -> None:  # noqa: D401
@@ -360,19 +366,46 @@ class _FadingStream(FishStream):
             output_emitter.end_input()
 
 
-class TTS(FishTTS):
-    """
-    Drop-in replacement for ``fishaudio_livekit.TTS`` that smooths the first
-    audio frames via a configurable fade-in.
-    """
+class TTS(lk_tts.TTS):
+    """Drop-in Fish Audio TTS implementation with fade-in smoothing."""
 
     def __init__(
         self,
         *,
+        api_key: str | None = None,
+        language: str = "en",
+        reference_id: str | None = None,
+        temperature: float = 0.7,
+        top_p: float = 0.7,
+        chunk_length: int | None = 120,
+        latency: str | None = None,
+        model: str = "s1",
+        speed: float = 1.0,
+        volume: float = 0.0,
+        sample_rate: int = SAMPLE_RATE,
         fade_duration_ms: Optional[int] = DEFAULT_FADE_MS,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(
+            capabilities=lk_tts.TTSCapabilities(streaming=True),
+            sample_rate=sample_rate,
+            num_channels=NUM_CHANNELS,
+        )
+        self._opts = _TTSOptions(
+            language=language,
+            reference_id=reference_id,
+            temperature=temperature,
+            top_p=top_p,
+            chunk_length=chunk_length,
+            latency=latency,
+            model=model,
+            speed=speed,
+            volume=volume,
+            sample_rate=sample_rate,
+        )
+        self._api_key = api_key or FISHAUDIO_API_KEY
+        if not self._api_key:
+            raise APIConnectionError("FISHAUDIO_API_KEY not set")
+        self._ws = WebSocketSession(self._api_key)
         self._fade_duration_ms = fade_duration_ms
 
     def synthesize(
@@ -381,10 +414,12 @@ class TTS(FishTTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> lk_tts.ChunkedStream:
-        return _FadingChunkedStream(
+        return ChunkedStream(
             tts=self,
             input_text=text,
             conn_options=conn_options,
+            opts=self._opts,
+            ws=self._ws,
             fade_duration_ms=self._fade_duration_ms,
         )
 
@@ -393,8 +428,10 @@ class TTS(FishTTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> lk_tts.SynthesizeStream:
-        return _FadingStream(
+        return Stream(
             tts=self,
             conn_options=conn_options,
+            opts=self._opts,
+            api_key=self._api_key,
             fade_duration_ms=self._fade_duration_ms,
         )
